@@ -1961,6 +1961,15 @@ This is usually set to a CloudFront CDN URL as AWS S3 offers
 cheaper egress for data downloaded through the CloudFront network.`,
 			Advanced: true,
 		}, {
+			Name:     "directory_markers",
+			Default:  false,
+			Advanced: true,
+			Help: `Upload an empty object with a trailing slash in name when new directory is created
+
+Empty folders are unsupported for bucket based remotes, this option creates an empty 
+object named "/", to persist folder.
+`,
+		}, {
 			Name: "use_multipart_etag",
 			Help: `Whether to use ETag in multipart uploads for verification
 
@@ -2097,6 +2106,7 @@ type Options struct {
 	MemoryPoolUseMmap     bool                 `config:"memory_pool_use_mmap"`
 	DisableHTTP2          bool                 `config:"disable_http2"`
 	DownloadURL           string               `config:"download_url"`
+	DirectoryMarkers      bool                 `config:"directory_markers"`
 	UseMultipartEtag      fs.Tristate          `config:"use_multipart_etag"`
 	UsePresignedRequest   bool                 `config:"use_presigned_request"`
 }
@@ -2230,6 +2240,11 @@ func parsePath(path string) (root string) {
 // relative to f.root
 func (f *Fs) split(rootRelativePath string) (bucketName, bucketPath string) {
 	bucketName, bucketPath = bucket.Split(path.Join(f.root, rootRelativePath))
+	// path.Join might have stripped trailing slash that can be used
+	// as an object name for bucket based remotes.
+	if strings.HasSuffix(rootRelativePath, "/") {
+		bucketPath += "/"
+	}
 	return f.opt.Enc.FromStandardName(bucketName), f.opt.Enc.FromStandardPath(bucketPath)
 }
 
@@ -3114,8 +3129,28 @@ func (f *Fs) bucketExists(ctx context.Context, bucket string) (bool, error) {
 
 // Mkdir creates the bucket if it doesn't exist
 func (f *Fs) Mkdir(ctx context.Context, dir string) error {
-	bucket, _ := f.split(dir)
-	return f.makeBucket(ctx, bucket)
+	bucket, directory := f.split(dir)
+	e := f.makeBucket(ctx, bucket)
+	if e != nil {
+		return e
+	}
+	// Create directory marker file
+	if f.opt.DirectoryMarkers && bucket != "" && directory != "" {
+		markerFilePath := fmt.Sprintf("%s/", directory)
+		markerFileContent := io.Reader(strings.NewReader(""))
+		markerFileObject := &Object{
+			fs:     f,
+			remote: markerFilePath,
+			meta: map[string]string{
+				metaMtime: swift.TimeToFloatString(time.Now()),
+			},
+		}
+		_, e := f.Put(ctx, markerFileContent, markerFileObject)
+		if e != nil {
+			return e
+		}
+	}
+	return nil
 }
 
 // makeBucket creates the bucket if it doesn't exist
@@ -3156,6 +3191,18 @@ func (f *Fs) makeBucket(ctx context.Context, bucket string) error {
 // Returns an error if it isn't empty
 func (f *Fs) Rmdir(ctx context.Context, dir string) error {
 	bucket, directory := f.split(dir)
+	// Remove directory marker file
+	if f.opt.DirectoryMarkers && bucket != "" && directory != "" {
+		markerFilePath := fmt.Sprintf("%s/", directory)
+		if f.rootDirectory != "" {
+			markerFilePath = fmt.Sprintf("%s/%s", f.rootDirectory, markerFilePath)
+		}
+		markerFileObject := &Object{
+			fs:     f,
+			remote: markerFilePath,
+		}
+		_ = markerFileObject.Remove(ctx)
+	}
 	if bucket == "" || directory != "" {
 		return nil
 	}
